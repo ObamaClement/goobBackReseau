@@ -1,0 +1,2416 @@
+=== ./src/main/java/com/example/security/UserDetailsServiceImpl.java ===
+package com.example.security;
+
+import com.example.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.stereotype.Service;
+
+import java.util.Collections;
+
+@Service
+@RequiredArgsConstructor
+public class UserDetailsServiceImpl implements UserDetailsService {
+
+    private final UserRepository userRepository;
+
+    @Override
+    public UserDetails loadUserByUsername(String username) throws UsernameNotFoundException {
+        return userRepository.findByUsername(username)
+                .map(appUser -> new User(
+                        appUser.getUsername(),
+                        appUser.getPassword(),
+                        Collections.singletonList(new SimpleGrantedAuthority(appUser.getRole().name()))
+                ))
+                .orElseThrow(() -> new UsernameNotFoundException("Utilisateur non trouvé avec le nom : " + username));
+    }
+}
+=== ./src/main/java/com/example/security/JwtAuthenticationFilter.java ===
+package com.example.security;
+
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.RequiredArgsConstructor;
+import org.springframework.lang.NonNull;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.web.authentication.WebAuthenticationDetailsSource;
+import org.springframework.stereotype.Component;
+//import org.springframework.util.StringUtils;
+import org.springframework.web.filter.OncePerRequestFilter;
+
+import java.io.IOException;
+
+@Component
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final JwtTokenProvider jwtTokenProvider;
+    private final UserDetailsService userDetailsService;
+
+    @Override
+    protected void doFilterInternal(
+            @NonNull HttpServletRequest request,
+            @NonNull HttpServletResponse response,
+            @NonNull FilterChain filterChain) throws ServletException, IOException {
+
+        final String authHeader = request.getHeader("Authorization");
+        if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            filterChain.doFilter(request, response);
+            return;
+        }
+
+        final String jwt = authHeader.substring(7);
+        final String username = jwtTokenProvider.getUsername(jwt);
+
+        if (username != null && SecurityContextHolder.getContext().getAuthentication() == null) {
+            UserDetails userDetails = this.userDetailsService.loadUserByUsername(username);
+            if (jwtTokenProvider.validateToken(jwt, userDetails)) {
+                UsernamePasswordAuthenticationToken authToken = new UsernamePasswordAuthenticationToken(
+                        userDetails, null, userDetails.getAuthorities());
+                authToken.setDetails(new WebAuthenticationDetailsSource().buildDetails(request));
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+        filterChain.doFilter(request, response);
+    }
+}
+=== ./src/main/java/com/example/security/JwtTokenProvider.java ===
+package com.example.security;
+
+import com.example.entity.User;
+import io.jsonwebtoken.Claims;
+import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.io.Decoders;
+import io.jsonwebtoken.security.Keys;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.stereotype.Component;
+
+import javax.crypto.SecretKey;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.function.Function;
+
+@Component
+public class JwtTokenProvider {
+
+    @Value("${app.jwt-secret}")
+    private String jwtSecret;
+
+    @Value("${app.jwt-expiration-milliseconds}")
+    private long jwtExpirationDate;
+
+    public String generateToken(User user) {
+        Map<String, Object> claims = new HashMap<>();
+        claims.put("role", user.getRole().name());
+        claims.put("userId", user.getId().toString());
+
+        return Jwts.builder()
+                .setClaims(claims)
+                .setSubject(user.getUsername())
+                .setIssuedAt(new Date(System.currentTimeMillis()))
+                .setExpiration(new Date(System.currentTimeMillis() + jwtExpirationDate))
+                .signWith(key())
+                .compact();
+    }
+
+    private SecretKey key() {
+        return Keys.hmacShaKeyFor(Decoders.BASE64.decode(jwtSecret));
+    }
+
+    public String getUsername(String token) {
+        return getClaim(token, Claims::getSubject);
+    }
+    
+    public <T> T getClaim(String token, Function<Claims, T> claimsResolver) {
+        final Claims claims = extractAllClaims(token);
+        return claimsResolver.apply(claims);
+    }
+    
+    public boolean validateToken(String token, UserDetails userDetails) {
+        final String username = getUsername(token);
+        return (username.equals(userDetails.getUsername()) && !isTokenExpired(token));
+    }
+
+    private boolean isTokenExpired(String token) {
+        return getClaim(token, Claims::getExpiration).before(new Date());
+    }
+    
+    private Claims extractAllClaims(String token) {
+        return Jwts.parser()
+                   .verifyWith(key())
+                   .build()
+                   .parseSignedClaims(token)
+                   .getPayload();
+    }
+}
+=== ./src/main/java/com/example/Main.java ===
+package com.example; // Assurez-vous que ce package correspond au vôtre
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class Main {
+
+    public static void main(String[] args) {
+        SpringApplication.run(Main.class, args);
+    }
+
+}
+=== ./src/main/java/com/example/entity/Product.java ===
+package com.example.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+/**
+ * Représente un produit. Chaque produit est possédé par un et un seul utilisateur (Éditeur).
+ */
+@Getter
+@Setter
+@Builder
+@AllArgsConstructor
+@NoArgsConstructor
+@Entity
+@Table(name = "products")
+public class Product {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.AUTO)
+    private UUID id;
+
+    @Column(nullable = false, length = 150)
+    private String title;
+
+    @Column(columnDefinition = "TEXT")
+    private String description;
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal price;
+
+    @Column(length = 255)
+    private String imageUrl;
+
+    @Column(length = 100)
+    private String category;
+
+    @Column(nullable = false)
+    private boolean inStock;
+
+    @Column(nullable = false, precision = 5, scale = 2)
+    private BigDecimal commissionRate;
+
+    @Column(nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+
+    @Column(nullable = false)
+    private LocalDateTime updatedAt;
+
+    // --- RELATION CLÉ ---
+    // Cette annotation crée la clé étrangère dans la base de données.
+    @ManyToOne(fetch = FetchType.LAZY) // LAZY: on ne charge l'éditeur que si on en a besoin.
+    @JoinColumn(name = "editor_id", nullable = false) // Nom de la colonne FK. `nullable = false` garantit qu'un produit a toujours un éditeur.
+    private User editor;
+
+    // --- CALLBACKS DE CYCLE DE VIE JPA ---
+    @PrePersist
+    protected void onCreate() {
+        createdAt = LocalDateTime.now();
+        updatedAt = LocalDateTime.now();
+    }
+
+    @PreUpdate
+    protected void onUpdate() {
+        updatedAt = LocalDateTime.now();
+    }
+}
+=== ./src/main/java/com/example/entity/Comment.java ===
+
+=== ./src/main/java/com/example/entity/Transaction.java ===
+package com.example.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+import org.hibernate.annotations.CreationTimestamp;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+/**
+ * Représente une vente effectuée sur la plateforme.
+ * C'est notre "livre de comptes" interne.
+ */
+@Getter
+@Setter
+@Builder
+@AllArgsConstructor
+@NoArgsConstructor
+@Entity
+@Table(name = "transactions")
+public class Transaction {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.AUTO)
+    private UUID id;
+
+    // Le produit qui a été vendu
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "product_id", nullable = false)
+    private Product product;
+
+    // L'utilisateur qui a acheté le produit
+    // NOTE : Peut être null si on autorise les achats anonymes
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "buyer_id")
+    private User buyer;
+
+    // L'affilié qui a apporté la vente (grâce à son code promo)
+    // Ce champ est optionnel.
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "affiliate_id")
+    private User affiliate;
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal amountPaid; // Le montant final payé par le client
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal editorEarnings; // Montant qui revient à l'éditeur
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal affiliateCommission; // Montant qui revient à l'affilié
+
+    @Column(nullable = false, precision = 10, scale = 2)
+    private BigDecimal platformFee; // Montant qui revient à la plateforme
+
+    @Column(nullable = false)
+    private String paymentGatewayTransactionId; // L'ID de transaction de YOWYOB, pour la réconciliation
+
+    @CreationTimestamp
+    @Column(nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+}
+=== ./src/main/java/com/example/entity/Post.java ===
+
+=== ./src/main/java/com/example/entity/CollaborationStatus.java ===
+package com.example.entity;
+
+public enum CollaborationStatus {
+    PENDING,    // En attente d'approbation (par l'éditeur)
+    ACTIVE,     // Collaboration acceptée et active
+    REJECTED,   // Demande refusée
+    TERMINATED  // Collaboration terminée (par l'une ou l'autre partie)
+}
+=== ./src/main/java/com/example/entity/User.java ===
+package com.example.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.UUID;
+
+@Getter
+@Setter
+@Builder
+@AllArgsConstructor
+@NoArgsConstructor
+@Entity
+@Table(name = "app_users")
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.AUTO)
+    private UUID id;
+
+    @Column(unique = true, nullable = false)
+    private String username;
+
+    @Column(nullable = false)
+    private String password;
+
+    @Column(unique = true, nullable = false)
+    private String email;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private UserRole role;
+
+    // -- Champs spécifiques à l'Éditeur (Entreprise) --
+    private String businessName;
+    @Column(columnDefinition = "TEXT")
+    private String bio;
+
+    // -- Champs spécifiques à l'Annonceur (Influenceur) --
+    private String profileImage;
+    private Long followers;
+    
+    // --- RELATIONS ---
+    
+    @OneToMany(mappedBy = "editor", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    @Builder.Default // CORRECTION
+    private List<Product> products = new ArrayList<>();
+
+    @OneToMany(mappedBy = "editor", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    @Builder.Default // CORRECTION
+    private Set<Collaboration> collaborationsAsEditor = new HashSet<>();
+
+    @OneToMany(mappedBy = "affiliate", cascade = CascadeType.ALL, orphanRemoval = true, fetch = FetchType.LAZY)
+    @Builder.Default // CORRECTION
+    private Set<Collaboration> collaborationsAsAffiliate = new HashSet<>();
+}
+=== ./src/main/java/com/example/entity/Collaboration.java ===
+package com.example.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+/**
+ * Entité de jointure représentant la collaboration entre un Éditeur et un Annonceur (Affilié).
+ * Modélise une relation Many-to-Many entre les utilisateurs.
+ */
+@Getter
+@Setter
+@Builder
+@AllArgsConstructor
+@NoArgsConstructor
+@Entity
+@Table(name = "collaborations")
+public class Collaboration {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.AUTO)
+    private UUID id;
+
+    // --- RELATION VERS L'ÉDITEUR ---
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "editor_id", nullable = false)
+    private User editor;
+
+    // --- RELATION VERS L'ANNONCEUR (AFFILIÉ) ---
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "affiliate_id", nullable = false)
+    private User affiliate;
+
+    // --- INFORMATIONS SUR LA COLLABORATION ---
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private CollaborationStatus status;
+
+    @Column(nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+    
+    private LocalDateTime approvedAt; // La date à laquelle la collaboration est devenue active
+    
+    @PrePersist
+    protected void onCreate() {
+        createdAt = LocalDateTime.now();
+        if (this.status == null) {
+            // Un statut par défaut si aucun n'est fourni
+            this.status = CollaborationStatus.PENDING; 
+        }
+    }
+}
+=== ./src/main/java/com/example/entity/Like.java ===
+
+=== ./src/main/java/com/example/entity/UserRole.java ===
+package com.example.entity;
+
+public enum UserRole {
+    ROLE_EDITOR,      // Pour les entreprises/éditeurs
+    ROLE_AFFILIATE,   // Pour les influenceurs/annonceurs
+    ROLE_CLIENT,      // Pour les acheteurs
+    ROLE_ADMIN        // Pour l'administration de la plateforme
+}
+=== ./src/main/java/com/example/service/OrchestrationService.java ===
+
+=== ./src/main/java/com/example/service/OrganizationService.java ===
+package com.example.service;
+
+import com.example.entity.User;
+import org.springframework.stereotype.Service;
+
+/**
+ * Interface pour le service gérant la logique métier liée aux profils professionnels
+ * sur l'API externe d'organisation (YOWYOB).
+ */
+@Service
+public interface OrganizationService {
+
+    /**
+     * Crée le profil professionnel d'un nouvel Éditeur sur l'API d'organisation.
+     * Cette méthode sera appelée après la création de l'identité de l'utilisateur.
+     *
+     * @param newUser L'entité User locale de l'éditeur qui vient d'être créé.
+     * @param yowyobUserToken Le token JWT de l'utilisateur YOWYOB, nécessaire pour autoriser l'appel.
+     */
+    void createEditorProfileOnExternalApi(User newUser, String yowyobUserToken);
+
+
+    /**
+     * Crée le profil professionnel d'un nouvel Annonceur (Affilié) sur l'API d'organisation.
+     * (Nous implémenterons cette méthode plus tard).
+     *
+     * @param newUser L'entité User locale de l'affilié qui vient d'être créé.
+     * @param yowyobUserToken Le token JWT de l'utilisateur YOWYOB.
+     */
+    // void createAffiliateProfileOnExternalApi(User newUser, String yowyobUserToken);
+    void createAffiliateProfileOnExternalApi(User newUser, String yowyobUserToken);
+}
+=== ./src/main/java/com/example/service/AuthService.java ===
+package com.example.service;
+
+import com.example.dto.request.LoginRequestDto;
+import com.example.dto.request.SignUpRequestDto;
+import com.example.dto.response.AuthResponseDto;
+import org.springframework.stereotype.Service;
+
+/**
+ * Interface pour le service d'authentification.
+ * Définit les opérations d'inscription et de connexion.
+ */
+@Service
+public interface AuthService {
+
+    /**
+     * Gère l'inscription d'un nouvel utilisateur.
+     * Cette méthode orchestrera l'appel à l'API externe et la création
+     * de l'utilisateur dans notre système local.
+     *
+     * @param signUpRequestDto Les données d'inscription.
+     * @return Une réponse d'authentification contenant un token.
+     */
+    AuthResponseDto register(SignUpRequestDto signUpRequestDto);
+    
+    // Nous ajouterons la méthode de login plus tard
+    // AuthResponseDto login(LoginRequestDto loginRequestDto);
+
+    AuthResponseDto login(LoginRequestDto loginRequestDto);
+
+}
+=== ./src/main/java/com/example/service/CollaborationService.java ===
+package com.example.service;
+
+import com.example.dto.request.CollaborationRequestDto;
+import com.example.dto.response.CollaborationResponseDto;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Interface pour le service gérant la logique métier des collaborations.
+ */
+@Service
+public interface CollaborationService {
+
+    /**
+     * Permet à un affilié authentifié de faire une demande de collaboration à un éditeur.
+     *
+     * @param requestDto      Le DTO contenant l'ID de l'éditeur ciblé.
+     * @param affiliateUsername Le nom d'utilisateur de l'affilié qui fait la demande (récupéré du token).
+     * @return Les détails de la collaboration créée avec le statut PENDING.
+     */
+    CollaborationResponseDto requestCollaboration(CollaborationRequestDto requestDto, String affiliateUsername);
+
+    /**
+     * Permet à un éditeur authentifié d'approuver une demande de collaboration.
+     *
+     * @param collaborationId L'ID de la collaboration à approuver.
+     * @param editorUsername  Le nom d'utilisateur de l'éditeur qui approuve (pour vérification de droit).
+     * @return Les détails de la collaboration mise à jour avec le statut ACTIVE.
+     */
+    CollaborationResponseDto approveCollaboration(UUID collaborationId, String editorUsername);
+    
+    /**
+     * Récupère toutes les collaborations pour un éditeur donné.
+     * Utile pour le dashboard de l'éditeur.
+     *
+     * @param editorId L'ID de l'éditeur.
+     * @return Une liste de ses collaborations.
+     */
+    List<CollaborationResponseDto> getCollaborationsForEditor(UUID editorId);
+    
+    /**
+     * Récupère toutes les collaborations pour un affilié donné.
+     * Utile pour le dashboard de l'affilié.
+     *
+     * @param affiliateId L'ID de l'affilié.
+     * @return Une liste de ses collaborations.
+     */
+    List<CollaborationResponseDto> getCollaborationsForAffiliate(UUID affiliateId);
+
+    // D'autres méthodes pourraient être ajoutées plus tard, comme :
+    // rejectCollaboration(UUID collaborationId, String editorUsername);
+    // terminateCollaboration(UUID collaborationId, String username);
+}
+=== ./src/main/java/com/example/service/ProductService.java ===
+package com.example.service;
+
+import com.example.dto.request.CreateProductRequestDto;
+import com.example.dto.response.ProductResponseDto;
+import org.springframework.stereotype.Service;
+
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Interface pour le service de gestion des produits.
+ * Définit le contrat pour toutes les opérations métier liées aux produits.
+ */
+@Service
+public interface ProductService {
+
+    /**
+     * Crée un nouveau produit pour l'utilisateur authentifié.
+     *
+     * @param requestDto DTO contenant les informations du produit à créer.
+     * @param username Le nom d'utilisateur de l'éditeur qui crée le produit.
+     * @return Le DTO du produit qui a été créé.
+     */
+    ProductResponseDto createProduct(CreateProductRequestDto requestDto, String username);
+
+    /**
+     * Récupère un produit par son identifiant unique.
+     *
+     * @param id L'UUID du produit à récupérer.
+     * @return Le DTO du produit trouvé.
+     * @throws com.example.exception.ResourceNotFoundException si aucun produit n'est trouvé.
+     */
+    ProductResponseDto getProductById(UUID id);
+
+    /**
+     * Récupère la liste de tous les produits.
+     *
+     * @return Une liste de DTOs de tous les produits.
+     */
+    List<ProductResponseDto> getAllProducts();
+
+    /**
+     * Récupère la liste de tous les produits pour un éditeur spécifique.
+     *
+     * @param editorId L'ID de l'éditeur.
+     * @return Une liste de DTOs des produits de cet éditeur.
+     */
+    List<ProductResponseDto> getProductsByEditor(UUID editorId);
+}
+=== ./src/main/java/com/example/service/impl/CollaborationServiceImpl.java ===
+package com.example.service.impl;
+
+import com.example.dto.request.CollaborationRequestDto;
+import com.example.dto.response.CollaborationResponseDto;
+import com.example.entity.Collaboration;
+import com.example.entity.CollaborationStatus;
+import com.example.entity.User;
+import com.example.entity.UserRole;
+import com.example.exception.ResourceNotFoundException;
+import com.example.repository.CollaborationRepository;
+import com.example.repository.UserRepository;
+import com.example.service.CollaborationService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class CollaborationServiceImpl implements CollaborationService {
+
+    private final CollaborationRepository collaborationRepository;
+    private final UserRepository userRepository;
+
+    @Override
+    @Transactional
+    public CollaborationResponseDto requestCollaboration(CollaborationRequestDto requestDto, String affiliateUsername) {
+        User affiliate = userRepository.findByUsername(affiliateUsername)
+                .orElseThrow(() -> new ResourceNotFoundException("Affilié non trouvé: " + affiliateUsername));
+        
+        User editor = userRepository.findById(requestDto.getEditorId())
+                .orElseThrow(() -> new ResourceNotFoundException("Éditeur non trouvé avec l'ID: " + requestDto.getEditorId()));
+
+        if (editor.getRole() != UserRole.ROLE_EDITOR) {
+            throw new IllegalArgumentException("Vous ne pouvez demander une collaboration qu'avec un éditeur.");
+        }
+
+        // TODO: Ajouter une vérification pour s'assurer qu'une demande n'existe pas déjà.
+
+        Collaboration newCollaboration = Collaboration.builder()
+                .affiliate(affiliate)
+                .editor(editor)
+                .status(CollaborationStatus.PENDING)
+                .build();
+        
+        Collaboration savedCollaboration = collaborationRepository.save(newCollaboration);
+        log.info("Nouvelle demande de collaboration créée par {} pour {}", affiliate.getUsername(), editor.getUsername());
+
+        return mapToDto(savedCollaboration);
+    }
+
+    @Override
+    @Transactional
+    public CollaborationResponseDto approveCollaboration(UUID collaborationId, String editorUsername) {
+        Collaboration collaboration = collaborationRepository.findById(collaborationId)
+                .orElseThrow(() -> new ResourceNotFoundException("Collaboration non trouvée avec l'ID: " + collaborationId));
+        
+        // Vérification de sécurité cruciale : l'utilisateur qui approuve est-il bien l'éditeur de cette collaboration ?
+        if (!collaboration.getEditor().getUsername().equals(editorUsername)) {
+            throw new AccessDeniedException("Vous n'avez pas la permission d'approuver cette collaboration.");
+        }
+        
+        if (collaboration.getStatus() != CollaborationStatus.PENDING) {
+            throw new IllegalStateException("Seule une collaboration en attente (PENDING) peut être approuvée.");
+        }
+
+        collaboration.setStatus(CollaborationStatus.ACTIVE);
+        collaboration.setApprovedAt(LocalDateTime.now());
+        
+        Collaboration updatedCollaboration = collaborationRepository.save(collaboration);
+        log.info("Collaboration ID {} approuvée par l'éditeur {}", collaborationId, editorUsername);
+
+        return mapToDto(updatedCollaboration);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<CollaborationResponseDto> getCollaborationsForEditor(UUID editorId) {
+        return collaborationRepository.findByEditorId(editorId).stream()
+                .map(this::mapToDto)
+                .collect(Collectors.toList());
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<CollaborationResponseDto> getCollaborationsForAffiliate(UUID affiliateId) {
+        return collaborationRepository.findByAffiliateId(affiliateId).stream()
+                .map(this::mapToDto)
+                .collect(Collectors.toList());
+    }
+
+    // --- Mapper Utilitaire ---
+
+    private CollaborationResponseDto mapToDto(Collaboration collaboration) {
+        CollaborationResponseDto.UserInfo editorInfo = CollaborationResponseDto.UserInfo.builder()
+                .userId(collaboration.getEditor().getId())
+                .username(collaboration.getEditor().getUsername())
+                .build();
+        
+        CollaborationResponseDto.UserInfo affiliateInfo = CollaborationResponseDto.UserInfo.builder()
+                .userId(collaboration.getAffiliate().getId())
+                .username(collaboration.getAffiliate().getUsername())
+                .build();
+        
+        return CollaborationResponseDto.builder()
+                .id(collaboration.getId())
+                .status(collaboration.getStatus())
+                .createdAt(collaboration.getCreatedAt())
+                .approvedAt(collaboration.getApprovedAt())
+                .editor(editorInfo)
+                .affiliate(affiliateInfo)
+                .build();
+    }
+}
+=== ./src/main/java/com/example/service/impl/ProductServiceImpl.java ===
+package com.example.service.impl;
+
+import com.example.dto.request.CreateProductRequestDto;
+import com.example.dto.response.ProductResponseDto;
+import com.example.entity.Product;
+import com.example.entity.User;
+import com.example.exception.ResourceNotFoundException; // <-- NOUVEL IMPORT
+import com.example.repository.ProductRepository;
+import com.example.repository.UserRepository;
+import com.example.service.ProductService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+public class ProductServiceImpl implements ProductService {
+
+    private final ProductRepository productRepository;
+    private final UserRepository userRepository; // On a besoin de ce repository
+
+    @Override
+    @Transactional
+    public ProductResponseDto createProduct(CreateProductRequestDto requestDto, String username) {
+        // --- MODIFICATION : Récupérer l'éditeur ---
+        User editor = userRepository.findByUsername(username)
+                .orElseThrow(() -> new ResourceNotFoundException("Utilisateur (éditeur) non trouvé avec le nom : " + username));
+        
+        // On pourrait ajouter une vérification pour s'assurer qu'il a le bon rôle,
+        // mais @PreAuthorize dans le controller est plus efficace pour ça.
+
+        Product product = mapToEntity(requestDto);
+        product.setEditor(editor); // On lie le produit à l'éditeur authentifié
+
+        Product savedProduct = productRepository.save(product);
+
+        return mapToResponseDto(savedProduct);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public ProductResponseDto getProductById(UUID id) {
+        Product product = productRepository.findById(id)
+                // --- MODIFICATION : Utiliser notre exception personnalisée ---
+                .orElseThrow(() -> new ResourceNotFoundException("Produit non trouvé avec l'ID : " + id));
+        
+        return mapToResponseDto(product);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<ProductResponseDto> getAllProducts() {
+        return productRepository.findAll().stream()
+                .map(this::mapToResponseDto)
+                .collect(Collectors.toList());
+    }
+    
+    // --- Méthode de l'interface non encore implémentée
+    // TODO: Implémenter la logique pour cette méthode
+    @Override
+    public List<ProductResponseDto> getProductsByEditor(UUID editorId) {
+        if (!userRepository.existsById(editorId)) {
+            throw new ResourceNotFoundException("Éditeur non trouvé avec l'ID : " + editorId);
+        }
+        return productRepository.findByEditorId(editorId).stream()
+                .map(this::mapToResponseDto)
+                .collect(Collectors.toList());
+    }
+
+    // --- Méthodes de mapping privées (Logique de conversion) ---
+
+    private Product mapToEntity(CreateProductRequestDto requestDto) {
+        return Product.builder()
+                .title(requestDto.getTitle())
+                .description(requestDto.getDescription())
+                .price(requestDto.getPrice())
+                .imageUrl(requestDto.getImageUrl())
+                .category(requestDto.getCategory())
+                .inStock(requestDto.getInStock())
+                .commissionRate(requestDto.getCommissionRate())
+                .build();
+    }
+
+    private ProductResponseDto mapToResponseDto(Product product) {
+        ProductResponseDto responseDto = new ProductResponseDto();
+        responseDto.setId(product.getId());
+        responseDto.setTitle(product.getTitle());
+        responseDto.setDescription(product.getDescription());
+        responseDto.setPrice(product.getPrice());
+        responseDto.setImageUrl(product.getImageUrl());
+        responseDto.setCategory(product.getCategory());
+        responseDto.setInStock(product.isInStock());
+        responseDto.setCommissionRate(product.getCommissionRate());
+        responseDto.setCreatedAt(product.getCreatedAt());
+        return responseDto;
+    }
+}
+=== ./src/main/java/com/example/service/impl/AuthServiceImpl.java ===
+package com.example.service.impl;
+
+import com.example.dto.request.LoginRequestDto;
+import com.example.dto.request.SignUpRequestDto;
+import com.example.dto.response.AuthResponseDto;
+import com.example.entity.User;
+import com.example.entity.UserRole; // <-- AJOUTER L'IMPORT
+import com.example.integration.yowyob.YowyobAuthClient;
+import com.example.integration.yowyob.dto.YowyobLoginResponse;
+import com.example.integration.yowyob.dto.YowyobRegisterRequest;
+import com.example.integration.yowyob.dto.YowyobUserResponse;
+import com.example.repository.UserRepository;
+import com.example.security.JwtTokenProvider;
+import com.example.service.AuthService;
+import com.example.service.OrganizationService; // <-- AJOUTER L'IMPORT
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.client.RestClientException;
+
+import java.util.Collections;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class AuthServiceImpl implements AuthService {
+
+    private final UserRepository userRepository;
+    private final YowyobAuthClient yowyobAuthClient;
+    private final OrganizationService organizationService; // <-- NOUVELLE DÉPENDANCE
+    private final JwtTokenProvider jwtTokenProvider;
+    
+    // Le AuthenticationManager n'est plus nécessaire si on délègue 100% de la validation du mdp à YOWYOB.
+    // private final AuthenticationManager authenticationManager; 
+
+    @Override
+    @Transactional
+    public AuthResponseDto register(SignUpRequestDto signUpRequestDto) {
+        if (userRepository.existsByUsername(signUpRequestDto.getUsername()) || userRepository.existsByEmail(signUpRequestDto.getEmail())) {
+            throw new IllegalArgumentException("Le nom d'utilisateur ou l'email est déjà pris.");
+        }
+        
+        String appToken = yowyobAuthClient.getApplicationToken();
+        log.debug("Token d'application pour register : {}", appToken);
+
+        YowyobRegisterRequest yowyobRequest = YowyobRegisterRequest.builder()
+                .username(signUpRequestDto.getUsername())
+                .email(signUpRequestDto.getEmail())
+                .password(signUpRequestDto.getPassword())
+                .firstName(signUpRequestDto.getFirstName())
+                .lastName(signUpRequestDto.getLastName())
+                .phoneNumber(signUpRequestDto.getPhoneNumber())
+                .authorities(Collections.emptyList())
+                .build();
+        
+        YowyobUserResponse yowyobUser;
+        try {
+            yowyobUser = yowyobAuthClient.registerUser(yowyobRequest, appToken);
+        } catch (RestClientException e) {
+            throw new IllegalStateException("Le service externe a refusé l'inscription d'identité.");
+        }
+
+        // Création de l'entité locale
+        User user = User.builder()
+                .id(yowyobUser.getId())
+                .username(yowyobUser.getUsername())
+                .email(yowyobUser.getEmail())
+                .password("EXTERNALLY_MANAGED")
+                .role(signUpRequestDto.getRole())
+                .businessName(signUpRequestDto.getBusinessName())
+                .bio(null) // A compléter plus tard si nécessaire
+                .build();
+        
+        // --- NOUVELLE LOGIQUE CONDITIONNELLE ---
+        if (user.getRole() == UserRole.ROLE_EDITOR) {
+            // Pour se connecter et obtenir le token de l'utilisateur qui vient d'être créé
+            YowyobLoginResponse loginResponse = yowyobAuthClient.loginUser(
+                    user.getUsername(), signUpRequestDto.getPassword(), appToken);
+            String yowyobUserToken = loginResponse.getAccessToken().getToken();
+            
+            // On utilise ce token pour créer le profil professionnel
+            organizationService.createEditorProfileOnExternalApi(user, yowyobUserToken);
+        } else if (user.getRole() == UserRole.ROLE_EDITOR) {
+            // ... (logique existante pour l'éditeur)
+        } else if (user.getRole() == UserRole.ROLE_AFFILIATE) {
+            // ---- MODIFICATION ICI ----
+            log.info("L'utilisateur est un affilié. Tentative de création du profil Business Actor...");
+            // On a besoin du token utilisateur pour cette opération aussi.
+            YowyobLoginResponse loginResponse = yowyobAuthClient.loginUser(
+                    user.getUsername(), signUpRequestDto.getPassword(), appToken);
+            String yowyobUserToken = loginResponse.getAccessToken().getToken();
+
+            // On utilise ce token pour créer le profil Business Actor
+            organizationService.createAffiliateProfileOnExternalApi(user, yowyobUserToken);
+        }
+        User savedUser = userRepository.save(user);
+        String transaffilToken = jwtTokenProvider.generateToken(savedUser);
+
+        return AuthResponseDto.builder()
+                .token(transaffilToken)
+                .userId(savedUser.getId())
+                .username(savedUser.getUsername())
+                .role(savedUser.getRole().name())
+                .build();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public AuthResponseDto login(LoginRequestDto loginRequestDto) {
+        // --- NOUVELLE LOGIQUE COMPLÈTE ---
+
+        // Étape 1 : Obtenir le Token d'Application
+        String appToken = yowyobAuthClient.getApplicationToken();
+        log.info("Étape 1/4 : Token d'Application obtenu.");
+
+        // Étape 2 : Utiliser le Token d'Application pour obtenir le Token Utilisateur YOWYOB
+        YowyobLoginResponse yowyobLoginResponse;
+        try {
+            yowyobLoginResponse = yowyobAuthClient.loginUser(
+                loginRequestDto.getUsername(), 
+                loginRequestDto.getPassword(), 
+                appToken
+            );
+            log.info("Étape 2/4 : Token Utilisateur YOWYOB obtenu pour {}.", loginRequestDto.getUsername());
+        } catch (RestClientException e) {
+            throw new IllegalArgumentException("Identifiants invalides auprès du service externe.", e);
+        }
+
+        // Étape 3 : Récupérer notre utilisateur local pour connaître son rôle TransAffil
+        User user = userRepository.findByUsername(loginRequestDto.getUsername())
+                .orElseThrow(() -> new UsernameNotFoundException("Utilisateur authentifié par YOWYOB mais non trouvé localement: " + loginRequestDto.getUsername()));
+        log.info("Étape 3/4 : Utilisateur local {} trouvé avec le rôle {}.", user.getUsername(), user.getRole());
+        
+        // Étape 4 : Générer notre propre token de session TransAffil
+        String transaffilToken = jwtTokenProvider.generateToken(user);
+        log.info("Étape 4/4 : Token de session TransAffil généré.");
+
+        // Construction de la réponse finale, incluant les tokens de débogage
+        return AuthResponseDto.builder()
+                .token(transaffilToken) // Le token pour le frontend
+                .userId(user.getId())
+                .username(user.getUsername())
+                .role(user.getRole().name())
+                .debugTokens(AuthResponseDto.DebugTokens.builder() // Infos pour nous aider
+                        .appToken(appToken)
+                        .yowyobUserToken(yowyobLoginResponse.getAccessToken().getToken())
+                        .build())
+                .build();
+    }
+}
+=== ./src/main/java/com/example/service/impl/OrganizationServiceImpl.java ===
+package com.example.service.impl;
+
+import com.example.entity.User;
+import com.example.integration.yowyob.YowyobOrganizationClient;
+import com.example.integration.yowyob.dto.CreateBusinessActorRequest;
+import com.example.integration.yowyob.dto.CreateOrganizationRequest;
+import com.example.service.OrganizationService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestClientException;
+
+import java.util.UUID;
+
+/**
+ * Implémentation du service gérant les profils professionnels.
+ */
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class OrganizationServiceImpl implements OrganizationService {
+
+    private final YowyobOrganizationClient organizationClient;
+
+    // L'ID de votre organisation "parente" chez YOWYOB.
+    // Pour l'instant, on le met en dur mais on pourrait le mettre en properties.
+    // **CECI EST UN UUID FACTICE À REMPLACER SI LE DÉVELOPPEUR VOUS EN DONNE UN**
+    @Value("${transaffil.parent-organization-id:a1b2c3d4-e5f6-7890-1234-567890abcdef}")
+    private UUID parentOrganizationId;
+
+
+    @Override
+    public void createEditorProfileOnExternalApi(User newUser, String yowyobUserToken) {
+        log.info("Préparation de la création du profil professionnel pour l'éditeur : {}", newUser.getUsername());
+
+        // 1. Construire la requête pour le YowyobOrganizationClient
+        CreateOrganizationRequest request = CreateOrganizationRequest.builder()
+                .name(newUser.getBusinessName()) // Utilise le nom d'entreprise fourni à l'inscription
+                .longName(newUser.getBusinessName())
+                .description(newUser.getBio())
+                // Ajoutez d'autres champs si nécessaire
+                .build();
+        
+        try {
+            // 2. Appeler le client pour exécuter la requête
+            organizationClient.createEditorProfile(request, yowyobUserToken, parentOrganizationId);
+            log.info("Le profil professionnel pour {} a été créé avec succès sur l'API d'organisation.", newUser.getUsername());
+        } catch (RestClientException e) {
+            // Dans un vrai projet, il faudrait gérer cette erreur de manière plus robuste.
+            // Par exemple, en annulant l'inscription de l'utilisateur de base si cette étape échoue.
+            // Pour l'instant, on se contente de logger l'erreur.
+            log.error("Échec de la création du profil professionnel pour l'éditeur {} : {}",
+                    newUser.getUsername(), e.getMessage());
+
+            // On propage l'exception pour que la transaction globale de l'inscription soit annulée.
+            throw new IllegalStateException("Impossible de finaliser le profil de l'éditeur sur le service externe.", e);
+        }
+    }
+
+
+    @Override
+    public void createAffiliateProfileOnExternalApi(User newUser, String yowyobUserToken) {
+        // LOG D'INTENTION
+        log.info("Préparation de la création du profil Business Actor pour l'affilié : {}", newUser.getUsername());
+
+        // 1. Construire la requête pour le YowyobOrganizationClient
+        CreateBusinessActorRequest request = CreateBusinessActorRequest.builder()
+                .email(newUser.getEmail())
+                .phoneNumber(null) // Le SignUpRequestDto n'a pas ce champ, à ajouter si nécessaire
+                .firstName(null)   // Le SignUpRequestDto n'a pas ces champs non plus
+                .lastName(null)
+                .biography("Affiliate on TransAffil platform")
+                .build();
+        
+        try {
+            // 2. Appeler le client pour exécuter la requête
+            organizationClient.createBusinessActor(request, yowyobUserToken);
+            // LOG DE SUCCÈS
+            log.info("Profil Business Actor pour {} créé avec succès sur YOWYOB.", newUser.getUsername());
+        } catch (RestClientException e) {
+            // LOG D'ERREUR
+            log.error("Échec de la création du profil Business Actor pour l'affilié {} : {}",
+                    newUser.getUsername(), e.getMessage());
+            throw new IllegalStateException("Impossible de finaliser le profil de l'affilié sur le service externe.", e);
+        }
+    }
+
+    
+}
+=== ./src/main/java/com/example/service/impl/OrchestrationServiceImpl.java ===
+
+=== ./src/main/java/com/example/integration/yowyob/YowyobAuthClient.java ===
+package com.example.integration.yowyob;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.example.integration.yowyob.dto.YowyobLoginResponse;
+import com.example.integration.yowyob.dto.YowyobRegisterRequest;
+import com.example.integration.yowyob.dto.YowyobUserResponse;
+import lombok.Data;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.http.*;
+import org.springframework.stereotype.Component;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+//import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestTemplate;
+import java.util.HashMap;
+import java.util.Map;
+
+@Component
+@Slf4j
+public class YowyobAuthClient {
+
+    private final RestTemplate restTemplate;
+    private final String authServiceBaseUrl;
+
+    @Data
+    private static class TokenResponse {
+        @JsonProperty("access_token")
+        private String accessToken;
+    }
+
+    public YowyobAuthClient(RestTemplateBuilder builder, @Value("${yowyob.api.auth.base-url}") String authUrl) {
+        this.restTemplate = builder.build();
+        this.authServiceBaseUrl = authUrl;
+    }
+
+    public String getApplicationToken() {
+        log.info("Demande d'un token d'application (client_credentials)...");
+        String tokenUrl = this.authServiceBaseUrl + "/oauth/token";
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+        headers.setBasicAuth("test-client", "secret");
+
+        MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+        body.add("grant_type", "client_credentials");
+        body.add("scope", "read write");
+        
+        HttpEntity<MultiValueMap<String, String>> entity = new HttpEntity<>(body, headers);
+        ResponseEntity<TokenResponse> response = restTemplate.postForEntity(tokenUrl, entity, TokenResponse.class);
+
+        if (response.getBody() == null || response.getBody().getAccessToken() == null) {
+            throw new IllegalStateException("Réponse invalide de l'API de token.");
+        }
+        return response.getBody().getAccessToken();
+    }
+
+    public YowyobUserResponse registerUser(YowyobRegisterRequest request, String appToken) {
+        String registerUrl = this.authServiceBaseUrl + "/api/register";
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(appToken);
+
+        HttpEntity<YowyobRegisterRequest> entity = new HttpEntity<>(request, headers);
+
+        log.info("Tentative d'inscription pour l'utilisateur: {} avec le token d'application.", request.getUsername());
+        ResponseEntity<YowyobUserResponse> response = restTemplate.exchange(
+                registerUrl, HttpMethod.POST, entity, YowyobUserResponse.class);
+        return response.getBody();
+    }
+
+    public YowyobLoginResponse loginUser(String username, String password, String appToken) {
+        String loginUrl = this.authServiceBaseUrl + "/api/login";
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(appToken);
+
+        Map<String, String> requestBody = new HashMap<>();
+        requestBody.put("username", username);
+        requestBody.put("password", password);
+
+        HttpEntity<Map<String, String>> entity = new HttpEntity<>(requestBody, headers);
+
+        log.info("Tentative de connexion YOWYOB pour : {}", username);
+        ResponseEntity<YowyobLoginResponse> response = restTemplate.exchange(
+                loginUrl, HttpMethod.POST, entity, YowyobLoginResponse.class);
+        return response.getBody();
+    }
+}
+=== ./src/main/java/com/example/integration/yowyob/dto/CreateBusinessActorRequest.java ===
+package com.example.integration.yowyob.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Builder;
+import lombok.Data;
+
+@Data
+@Builder
+public class CreateBusinessActorRequest {
+    
+    // On mappe les informations de base de notre utilisateur
+    private String email;
+    
+    @JsonProperty("phone_number")
+    private String phoneNumber;
+
+    @JsonProperty("first_name")
+    private String firstName;
+    
+    @JsonProperty("last_name")
+    private String lastName;
+
+    // Champs par défaut pour un affilié
+    @JsonProperty("is_individual")
+    private final boolean isIndividual = true; // Un affilié est typiquement un individu
+
+    private String profession = "Digital Content Creator"; // Profession par défaut
+
+    private String biography = "Affiliate partner of TransAffil Platform"; // Bio par défaut
+    
+    // "PROVIDER" car l'affilié "fournit" un service de promotion
+    private String type = "PROVIDER";
+}
+=== ./src/main/java/com/example/integration/yowyob/dto/YowyobRegisterRequest.java ===
+package com.example.integration.yowyob.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Builder;
+import lombok.Data;
+import java.util.List;
+
+/**
+ * DTO représentant la requête à envoyer à l'API YOWYOB pour l'inscription.
+ * Les noms de champs correspondent exactement à la structure JSON attendue par l'API externe.
+ */
+@Data
+@Builder
+public class YowyobRegisterRequest {
+
+    private String username;
+    private String email;
+    private String password;
+
+    // L'annotation @JsonProperty est utile si les conventions de nommage
+    // diffèrent entre Java (camelCase) et le JSON (snake_case).
+    @JsonProperty("first_name")
+    private String firstName;
+
+    @JsonProperty("last_name")
+    private String lastName;
+
+    @JsonProperty("phone_number")
+    private String phoneNumber;
+
+    private List<Authority> authorities;
+
+    // Classe interne pour représenter la structure imbriquée de l'autorité
+    @Data
+    @Builder
+    public static class Authority {
+        private String name;
+    }
+}
+=== ./src/main/java/com/example/integration/yowyob/dto/PayInRequestDto.java ===
+package com.example.integration.yowyob.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Builder;
+import lombok.Data;
+
+import java.math.BigDecimal;
+
+/**
+ * DTO pour la requête de paiement (Pay-in) envoyée à l'API YOWYOB.
+ * Les noms des champs correspondent exactement à la documentation de l'API externe.
+ */
+@Data
+@Builder
+public class PayInRequestDto {
+
+    @JsonProperty("transaction_amount")
+    private BigDecimal transactionAmount;
+
+    @JsonProperty("transaction_currency")
+    private final String transactionCurrency = "XAF"; // Devise fixée selon la documentation
+
+    @JsonProperty("transaction_method")
+    private final String transactionMethod = "MOBILE"; // Méthode de paiement fixée
+
+    // Notre référence interne (ex: l'ID de notre Transaction locale)
+    @JsonProperty("transaction_reference")
+    private String transactionReference;
+
+    @JsonProperty("payer_reference")
+    private String payerReference; // ID de l'acheteur s'il est connu
+
+    @JsonProperty("payer_name")
+    private String payerName;
+
+    @JsonProperty("payer_phone_number")
+    private String payerPhoneNumber;
+    
+    @JsonProperty("payer_lang")
+    private final String payerLang = "fr"; // Langue fixée
+
+    @JsonProperty("payer_email")
+    private String payerEmail;
+
+    // Informations sur le service/produit acheté
+    @JsonProperty("service_reference")
+    private String serviceReference; // Ex: L'ID de notre produit
+    
+    @JsonProperty("service_name")
+    private String serviceName;
+    
+    @JsonProperty("service_description")
+    private String serviceDescription;
+
+    @JsonProperty("service_quantity")
+    private int serviceQuantity = 1; // On suppose 1 par transaction pour l'instant
+}
+=== ./src/main/java/com/example/integration/yowyob/dto/PayInResponseDto.java ===
+package com.example.integration.yowyob.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Data;
+
+import java.util.UUID;
+
+/**
+ * DTO pour mapper la réponse de l'endpoint /payin de l'API YOWYOB.
+ */
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true) // Très important pour ignorer les autres champs (status, ok, errors...)
+public class PayInResponseDto {
+
+    // On s'intéresse principalement à l'objet 'data' imbriqué
+    @JsonProperty("data")
+    private PayInData data;
+
+    // Classe interne pour mapper l'objet "data"
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class PayInData {
+
+        private String message;
+
+        @JsonProperty("status_code")
+        private int statusCode;
+
+        @JsonProperty("transaction_code")
+        private UUID transactionCode; // C'est l'ID de transaction de YOWYOB
+
+        @JsonProperty("transaction_status")
+        private String transactionStatus; // Ex: "CREATED", "PENDING"
+    }
+}
+=== ./src/main/java/com/example/integration/yowyob/dto/CreateOrganizationRequest.java ===
+package com.example.integration.yowyob.dto;
+
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Builder;
+import lombok.Data;
+
+/**
+ * DTO pour la requête de création d'une Organisation (Éditeur)
+ * auprès de l'API YOWYOB organization-service.
+ */
+@Data
+@Builder
+public class CreateOrganizationRequest {
+
+    // On suppose qu'un Éditeur est un "PROVIDER" (fournisseur de produits/offres)
+    // Le type "11" pourrait correspondre à "Provider" dans leur système.
+    @JsonProperty("type")
+    private final String type = "11"; 
+    
+    // Le nom commercial de l'éditeur
+    @JsonProperty("name")
+    private String name;
+
+    // Le nom long ou légal
+    @JsonProperty("long_name")
+    private String longName;
+
+    // Une description/biographie de l'entreprise
+    @JsonProperty("description")
+    private String description;
+
+    // URL du logo
+    @JsonProperty("logo")
+    private String logo;
+
+    // Numéro de taxe, SIRET, etc. (optionnel mais bon à avoir)
+    @JsonProperty("tax_number")
+    private String taxNumber;
+    
+    // Et d'autres champs si nécessaires...
+}
+=== ./src/main/java/com/example/integration/yowyob/dto/YowyobLoginResponse.java ===
+package com.example.integration.yowyob.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Data;
+
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * DTO pour désérialiser la réponse complète de l'endpoint /api/login de YOWYOB.
+ */
+@Data
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class YowyobLoginResponse {
+
+    @JsonProperty("access_token")
+    private AccessTokenInfo accessToken;
+
+    private UserInfo user;
+    private List<String> roles;
+    private List<String> permissions;
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class AccessTokenInfo {
+        private String token;
+        private String type;
+        @JsonProperty("expire_in")
+        private int expiresIn;
+    }
+
+    @Data
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    public static class UserInfo {
+        private UUID id;
+        private String username;
+        private String email;
+    }
+}
+=== ./src/main/java/com/example/integration/yowyob/dto/YowyobUserResponse.java ===
+package com.example.integration.yowyob.dto;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+/**
+ * DTO représentant la réponse reçue de l'API YOWYOB après la création
+ * ou la récupération d'un utilisateur.
+ * Les noms de champs correspondent au JSON renvoyé par l'API externe.
+ */
+@Data
+// Ignore toutes les propriétés inconnues que l'API pourrait renvoyer et que nous ne gérons pas.
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class YowyobUserResponse {
+
+    private UUID id;
+
+    private String username;
+
+    private String email;
+
+    @JsonProperty("first_name")
+    private String firstName;
+
+    @JsonProperty("last_name")
+    private String lastName;
+
+    @JsonProperty("phone_number")
+    private String phoneNumber;
+
+    @JsonProperty("email_verified")
+    private boolean emailVerified;
+
+    @JsonProperty("created_at")
+    private LocalDateTime createdAt;
+}
+=== ./src/main/java/com/example/integration/yowyob/dto/YowyobOrganizationResponse.java ===
+
+=== ./src/main/java/com/example/integration/yowyob/YowyobPaymentClient.java ===
+package com.example.integration.yowyob;
+
+import com.example.integration.yowyob.dto.PayInRequestDto;
+import com.example.integration.yowyob.dto.PayInResponseDto;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestTemplate;
+
+/**
+ * Client HTTP pour communiquer avec le microservice de paiement de YOWYOB.
+ */
+@Component
+@Slf4j
+public class YowyobPaymentClient {
+
+    private final RestTemplate restTemplate;
+    private final String paymentServiceBaseUrl;
+
+    // --- On aura besoin du token d'application, comme pour l'autre client ---
+    private final YowyobAuthClient yowyobAuthClient;
+
+    public YowyobPaymentClient(RestTemplateBuilder builder,
+                               @Value("${yowyob.api.payment.base-url}") String paymentUrl,
+                               YowyobAuthClient authClient) {
+        this.restTemplate = builder.build();
+        this.paymentServiceBaseUrl = paymentUrl;
+        this.yowyobAuthClient = authClient;
+    }
+    
+    /**
+     * Initialise une transaction de paiement (Pay-in) auprès de l'API YOWYOB.
+     *
+     * @param request Le DTO contenant tous les détails du paiement.
+     * @return La réponse structurée de l'API de paiement.
+     * @throws RestClientException Si l'appel à l'API échoue.
+     */
+    public PayInResponseDto initiatePayIn(PayInRequestDto request) throws RestClientException {
+        // 1. Obtenir un token d'application valide pour autoriser notre requête
+        String appToken = yowyobAuthClient.getApplicationToken();
+        
+        String payInUrl = this.paymentServiceBaseUrl + "/payin";
+
+        // 2. Préparer les en-têtes de la requête, y compris le Bearer Token
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.setBearerAuth(appToken);
+
+        // 3. Créer l'entité de la requête avec le corps et les en-têtes
+        HttpEntity<PayInRequestDto> entity = new HttpEntity<>(request, headers);
+
+        log.info("Initiation d'un paiement (Pay-in) pour la référence : {}", request.getTransactionReference());
+        
+        try {
+            // 4. Envoyer la requête POST
+            ResponseEntity<PayInResponseDto> response = restTemplate.exchange(
+                    payInUrl,
+                    HttpMethod.POST,
+                    entity,
+                    PayInResponseDto.class
+            );
+
+            log.info("Réponse reçue de l'API Pay-in avec le statut : {}", response.getStatusCode());
+            return response.getBody();
+
+        } catch (RestClientException e) {
+            log.error("Erreur lors de l'appel à l'API Pay-in : {}", e.getMessage(), e);
+            throw e; // Propage l'exception pour que le service métier la gère
+        }
+    }
+}
+=== ./src/main/java/com/example/integration/yowyob/YowyobOrganizationClient.java ===
+package com.example.integration.yowyob;
+
+import com.example.integration.yowyob.dto.CreateBusinessActorRequest;
+import com.example.integration.yowyob.dto.CreateOrganizationRequest;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.web.client.RestTemplateBuilder;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.MediaType;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestClientException;
+import org.springframework.web.client.RestTemplate;
+//import com.example.integration.yowyob.dto.CreateBusinessActorRequest; // Nouvel import
+
+
+import java.util.UUID;
+
+/**
+ * Client HTTP pour communiquer avec le microservice d'organisation de YOWYOB.
+ */
+@Component
+@Slf4j
+public class YowyobOrganizationClient {
+
+    private final RestTemplate restTemplate;
+    private final String organizationServiceBaseUrl;
+
+    // --- Injection des clés d'application ---
+    @Value("${yowyob.api.app-id}")
+    private String appId;
+    @Value("${yowyob.api.public-key}")
+    private String publicKey;
+    // La clé secrète n'est pas utilisée pour l'instant car nous ne signons pas les requêtes.
+    // @Value("${yowyob.api.secret-key}")
+    // private String secretKey;
+
+
+    public YowyobOrganizationClient(RestTemplateBuilder builder,
+                                    @Value("${yowyob.api.organization.base-url}") String orgUrl) {
+        this.restTemplate = builder.build();
+        this.organizationServiceBaseUrl = orgUrl;
+    }
+    
+    /**
+     * Crée une organisation (ou un 'ThirdParty' de type 'Provider') pour un utilisateur éditeur.
+     *
+     * @param request Le DTO contenant les informations de l'organisation à créer.
+     * @param userYowyobToken Le token JWT de l'utilisateur YOWYOB, prouvant son autorisation.
+     * @param organizationId L'ID de l'organisation "parente", probablement l'ID de votre propre organisation TransAffil chez YOWYOB.
+     */
+    public void createEditorProfile(CreateOrganizationRequest request, String userYowyobToken, UUID organizationId) throws RestClientException {
+        // L'endpoint exact pourrait être /organizations/{id}/third-parties/{type}
+        // Il faut clarifier ce que représente {organization_id} dans ce contexte.
+        // Hypothèse: c'est un ID global pour votre plateforme TransAffil.
+        String url = String.format("%s/organizations/%s/third-parties/%s",
+                organizationServiceBaseUrl, organizationId, request.getType());
+
+        // 1. Créer les en-têtes avec TOUTES les informations nécessaires
+        HttpHeaders headers = createAuthenticatedHeaders(userYowyobToken);
+        
+        HttpEntity<CreateOrganizationRequest> entity = new HttpEntity<>(request, headers);
+
+        log.info("Appel à YOWYOB pour créer un profil Éditeur (ThirdParty) pour l'organisation: {}", organizationId);
+
+        try {
+            // On envoie la requête et on ne s'attend pas forcément à un corps de réponse complexe (d'où Void.class)
+            // Si l'API renvoie un objet, on pourra changer Void.class par un DTO de réponse.
+            restTemplate.exchange(url, HttpMethod.POST, entity, Void.class);
+            log.info("Profil Éditeur créé avec succès sur YOWYOB.");
+        } catch (RestClientException e) {
+            log.error("Erreur lors de la création du profil Éditeur sur YOWYOB: {}", e.getMessage());
+            throw e;
+        }
+    }
+
+
+
+    
+
+
+    /**
+     * Méthode utilitaire pour créer les en-têtes avec la double authentification.
+     * @param userToken Le token JWT de l'utilisateur.
+     * @return un objet HttpHeaders configuré.
+     */
+    private HttpHeaders createAuthenticatedHeaders(String userToken) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+
+        // Authentification de l'utilisateur
+        headers.setBearerAuth(userToken);
+
+        // Identification de l'application
+        headers.set("X-Application-ID", appId);
+        headers.set("X-Public-Key", publicKey);
+
+        return headers;
+    }
+    
+    // Des méthodes pour createBusinessActor, etc., viendront ici.
+
+    public void createBusinessActor(CreateBusinessActorRequest request, String userYowyobToken) throws RestClientException {
+        String url = this.organizationServiceBaseUrl + "/business-actors";
+
+        // Les en-têtes sont les mêmes que pour la création d'une organisation
+        HttpHeaders headers = createAuthenticatedHeaders(userYowyobToken);
+        
+        HttpEntity<CreateBusinessActorRequest> entity = new HttpEntity<>(request, headers);
+
+        // LOG D'INTENTION
+        log.info("Appel à YOWYOB pour créer un Business Actor pour l'email: {}", request.getEmail());
+        
+        try {
+            // On envoie la requête
+            restTemplate.exchange(url, HttpMethod.POST, entity, Void.class);
+            // LOG DE SUCCÈS
+            log.info("Business Actor créé avec succès sur YOWYOB.");
+        } catch (RestClientException e) {
+            // LOG D'ERREUR
+            log.error("Erreur lors de la création du Business Actor sur YOWYOB: {}", e.getMessage());
+            throw e;
+        }
+    }
+
+
+
+}
+=== ./src/main/java/com/example/dto/request/SignUpRequestDto.java ===
+package com.example.dto.request;
+
+import com.example.entity.UserRole;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+/**
+ * DTO pour la requête d'inscription reçue par notre propre API.
+ */
+@Data
+public class SignUpRequestDto {
+
+    @NotBlank(message = "Le nom d'utilisateur est obligatoire.")
+    @Size(min = 3, max = 50)
+    private String username;
+
+    @NotBlank(message = "L'email est obligatoire.")
+    @Email(message = "Le format de l'email est invalide.")
+    private String email;
+
+    @NotBlank(message = "Le mot de passe est obligatoire.")
+    @Size(min = 8, message = "Le mot de passe doit faire au moins 8 caractères.")
+    private String password;
+    
+    @NotBlank(message = "Le prénom est obligatoire.")
+    private String firstName;
+    
+    @NotBlank(message = "Le nom de famille est obligatoire.")
+    private String lastName;
+    
+    @NotBlank(message = "Le numéro de téléphone est obligatoire.")
+    private String phoneNumber;
+
+    @NotNull(message = "Le rôle de l'utilisateur est obligatoire (ex: ROLE_EDITOR, ROLE_AFFILIATE).")
+    private UserRole role;
+
+    // Champs optionnels qui dépendent du rôle
+    private String businessName; // Pour les éditeurs
+    private Long followers;      // Pour les affiliés
+}
+=== ./src/main/java/com/example/dto/request/CollaborationRequestDto.java ===
+package com.example.dto.request;
+
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+import java.util.UUID;
+
+/**
+ * DTO pour une requête de demande de collaboration de la part d'un Annonceur (Affilié).
+ */
+@Data
+public class CollaborationRequestDto {
+
+    /**
+     * L'ID de l'utilisateur Éditeur avec lequel l'affilié souhaite collaborer.
+     * Ce champ est obligatoire.
+     */
+    @NotNull(message = "L'ID de l'éditeur est obligatoire.")
+    private UUID editorId;
+
+}
+=== ./src/main/java/com/example/dto/request/PurchaseRequestDto.java ===
+package com.example.dto.request;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import lombok.Data;
+
+import java.util.UUID;
+
+/**
+ * DTO représentant la requête d'un client pour acheter un produit.
+ */
+@Data
+public class PurchaseRequestDto {
+
+    // --- Détails du Produit ---
+    @NotNull(message = "L'ID du produit est obligatoire.")
+    private UUID productId;
+
+    // --- Code Promo (Optionnel) ---
+    private String promoCode; 
+
+    // --- Informations de l'Acheteur pour le Paiement ---
+    // Ces informations sont requises par l'API de paiement YOWYOB
+    @NotBlank(message = "Le nom du payeur est obligatoire.")
+    private String payerName;
+
+    @NotBlank(message = "Le numéro de téléphone du payeur est obligatoire.")
+    private String payerPhoneNumber;
+
+    @NotBlank(message = "L'email du payeur est obligatoire.")
+    @Email(message = "Le format de l'email est invalide.")
+    private String payerEmail;
+
+    // L'ID de l'utilisateur acheteur s'il est connecté (optionnel)
+    // Utile pour lier la transaction à un compte client.
+    private UUID buyerId;
+}
+=== ./src/main/java/com/example/dto/request/CreateProductRequestDto.java ===
+package com.example.dto.request;
+
+import jakarta.validation.constraints.DecimalMin;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+import java.math.BigDecimal;
+
+/**
+ * DTO (Data Transfer Object) pour la requête de création d'un nouveau produit.
+ * Contient les validations pour les données entrantes.
+ */
+@Data // Annotation Lombok pour générer getters, setters, etc.
+public class CreateProductRequestDto {
+
+    @NotBlank(message = "Le titre ne peut pas être vide.")
+    @Size(max = 150, message = "Le titre ne doit pas dépasser 150 caractères.")
+    private String title;
+
+    @Size(max = 1000, message = "La description ne doit pas dépasser 1000 caractères.")
+    private String description;
+
+    @NotNull(message = "Le prix est obligatoire.")
+    @DecimalMin(value = "0.01", message = "Le prix doit être supérieur à 0.")
+    private BigDecimal price;
+
+    @Size(max = 255, message = "L'URL de l'image est trop longue.")
+    private String imageUrl;
+
+    @NotBlank(message = "La catégorie est obligatoire.")
+    private String category;
+
+    @NotNull(message = "Le statut 'en stock' est obligatoire.")
+    private Boolean inStock;
+
+    @NotNull(message = "Le taux de commission est obligatoire.")
+    @DecimalMin(value = "0.1", message = "Le taux de commission doit être d'au moins 0.1%.")
+    private BigDecimal commissionRate;
+}
+=== ./src/main/java/com/example/dto/request/LoginRequestDto.java ===
+package com.example.dto.request;
+
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+
+/**
+ * DTO pour la requête de connexion d'un utilisateur.
+ */
+@Data
+public class LoginRequestDto {
+
+    @NotBlank(message = "Le nom d'utilisateur est obligatoire.")
+    private String username;
+
+    @NotBlank(message = "Le mot de passe est obligatoire.")
+    private String password;
+}
+=== ./src/main/java/com/example/dto/response/EditorProfileResponse.java ===
+
+=== ./src/main/java/com/example/dto/response/AffiliateProfileResponse.java ===
+
+=== ./src/main/java/com/example/dto/response/AuthResponseDto.java ===
+package com.example.dto.response;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Builder;
+import lombok.Data;
+import java.util.UUID;
+
+@Data
+@Builder
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class AuthResponseDto {
+
+    private String token; // Token de session TransAffil
+    private final String tokenType = "Bearer";
+    private UUID userId;
+    private String username;
+    private String role;
+    
+    // Champs de Débogage pour voir tous les tokens
+    private DebugTokens debugTokens;
+    
+    @Data
+    @Builder
+    public static class DebugTokens {
+        private String appToken;
+        private String yowyobUserToken;
+    }
+}
+=== ./src/main/java/com/example/dto/response/PurchaseResponseDto.java ===
+package com.example.dto.response;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+import lombok.Builder;
+import lombok.Data;
+
+import java.util.UUID;
+
+/**
+ * DTO représentant la réponse de notre API après une tentative d'achat.
+ */
+@Data
+@Builder
+@JsonInclude(JsonInclude.Include.NON_NULL) // N'inclut pas les champs null dans le JSON
+public class PurchaseResponseDto {
+
+    /**
+     * L'ID de notre transaction locale, créée dans notre base de données.
+     * Utile pour des requêtes de suivi ultérieures.
+     */
+    private UUID localTransactionId;
+
+    /**
+     * L'ID de transaction renvoyé par la passerelle de paiement YOWYOB.
+     * Essentiel pour la réconciliation et la vérification du statut.
+     */
+    private String paymentGatewayTransactionId;
+
+    /**
+     * Le statut initial de la transaction renvoyé par YOWYOB (ex: "PENDING", "SUCCESS").
+     */
+    private String transactionStatus;
+
+    /**
+     * Un message lisible pour le frontend (ex: "Paiement initié. Veuillez confirmer sur votre mobile.").
+     */
+    private String message;
+
+    /**
+     * URL de redirection potentielle si la passerelle de paiement en fournit une.
+     * (Optionnel, dépend de l'API de paiement).
+     */
+    private String redirectUrl;
+}
+=== ./src/main/java/com/example/dto/response/CollaborationResponseDto.java ===
+package com.example.dto.response;
+
+import com.example.entity.CollaborationStatus;
+import lombok.Builder;
+import lombok.Data;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+/**
+ * DTO représentant les informations d'une collaboration à renvoyer au client.
+ */
+@Data
+@Builder
+public class CollaborationResponseDto {
+
+    private UUID id;
+    private CollaborationStatus status;
+    private LocalDateTime createdAt;
+    private LocalDateTime approvedAt;
+
+    // Informations sur l'Éditeur
+    private UserInfo editor;
+
+    // Informations sur l'Annonceur (Affilié)
+    private UserInfo affiliate;
+
+    /**
+     * Sous-DTO pour ne renvoyer que les informations publiques de base
+     * d'un utilisateur, évitant ainsi de fuiter des données sensibles.
+     */
+    @Data
+    @Builder
+    public static class UserInfo {
+        private UUID userId;
+        private String username;
+        // On pourrait ajouter d'autres champs publics comme businessName ou profileImage ici
+    }
+}
+=== ./src/main/java/com/example/dto/response/ProductResponseDto.java ===
+package com.example.dto.response;
+
+import lombok.Data;
+
+import java.math.BigDecimal;
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+/**
+ * DTO pour la réponse API lors de la récupération d'un produit.
+ * Représente la structure de données "propre" et "sûre" envoyée au frontend.
+ */
+@Data
+public class ProductResponseDto {
+
+    private UUID id;
+    private String title;
+    private String description;
+    private BigDecimal price;
+    private String imageUrl;
+    private String category;
+    private boolean inStock;
+    private BigDecimal commissionRate;
+    private LocalDateTime createdAt;
+    
+    // On pourrait choisir de ne pas exposer updatedAt si ce n'est pas utile au frontend.
+    // private LocalDateTime updatedAt; 
+}
+=== ./src/main/java/com/example/controller/CollaborationController.java ===
+package com.example.controller;
+
+import com.example.dto.request.CollaborationRequestDto;
+import com.example.dto.response.CollaborationResponseDto;
+import com.example.service.CollaborationService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.UUID;
+
+/**
+ * Controller pour gérer les collaborations entre Éditeurs et Annonceurs.
+ */
+@RestController
+@RequestMapping("/api/v1/collaborations")
+@RequiredArgsConstructor
+@Slf4j
+public class CollaborationController {
+
+    private final CollaborationService collaborationService;
+
+    /**
+     * Endpoint pour qu'un Annonceur (affilié) demande une collaboration avec un Éditeur.
+     * Accessible uniquement aux utilisateurs avec le rôle ROLE_AFFILIATE.
+     *
+     * @param requestDto Le corps de la requête contenant l'ID de l'éditeur ciblé.
+     * @return Les détails de la collaboration créée en attente.
+     */
+    @PostMapping
+    @PreAuthorize("hasAuthority('ROLE_AFFILIATE')")
+    public ResponseEntity<CollaborationResponseDto> requestCollaboration(@Valid @RequestBody CollaborationRequestDto requestDto) {
+        String affiliateUsername = SecurityContextHolder.getContext().getAuthentication().getName();
+        log.info("Demande de collaboration de l'affilié {} pour l'éditeur {}", affiliateUsername, requestDto.getEditorId());
+        
+        CollaborationResponseDto response = collaborationService.requestCollaboration(requestDto, affiliateUsername);
+        
+        return new ResponseEntity<>(response, HttpStatus.CREATED);
+    }
+
+    /**
+     * Endpoint pour qu'un Éditeur approuve une demande de collaboration.
+     * Accessible uniquement aux utilisateurs avec le rôle ROLE_EDITOR.
+     *
+     * @param collaborationId L'ID de la collaboration à approuver.
+     * @return Les détails de la collaboration mise à jour.
+     */
+    @PutMapping("/{collaborationId}/approve")
+    @PreAuthorize("hasAuthority('ROLE_EDITOR')")
+    public ResponseEntity<CollaborationResponseDto> approveCollaboration(@PathVariable UUID collaborationId) {
+        String editorUsername = SecurityContextHolder.getContext().getAuthentication().getName();
+        log.info("Approbation de la collaboration {} par l'éditeur {}", collaborationId, editorUsername);
+        
+        CollaborationResponseDto response = collaborationService.approveCollaboration(collaborationId, editorUsername);
+
+        return ResponseEntity.ok(response);
+    }
+}
+=== ./src/main/java/com/example/controller/PostController.java ===
+
+=== ./src/main/java/com/example/controller/e.java ===
+
+=== ./src/main/java/com/example/controller/AuthController.java ===
+package com.example.controller;
+
+import com.example.dto.request.LoginRequestDto;
+import com.example.dto.request.SignUpRequestDto;
+import com.example.dto.response.AuthResponseDto;
+import com.example.service.AuthService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * Controller pour les endpoints d'authentification (inscription, connexion).
+ * Tous les endpoints ici sont publics car définis dans SecurityConfig.
+ */
+@RestController
+@RequestMapping("/api/v1/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private final AuthService authService;
+
+    /**
+     * Endpoint pour l'inscription d'un nouvel utilisateur.
+     */
+    @PostMapping("/register")
+    public ResponseEntity<AuthResponseDto> registerUser(@Valid @RequestBody SignUpRequestDto signUpRequestDto) {
+        AuthResponseDto response = authService.register(signUpRequestDto);
+        return ResponseEntity.ok(response);
+    }
+    
+    /**
+     * Endpoint pour la connexion d'un utilisateur existant.
+     */
+    @PostMapping("/login")
+    public ResponseEntity<AuthResponseDto> loginUser(@Valid @RequestBody LoginRequestDto loginRequestDto) {
+        AuthResponseDto response = authService.login(loginRequestDto);
+        return ResponseEntity.ok(response);
+    }
+}
+=== ./src/main/java/com/example/controller/UserProfileController.java ===
+
+=== ./src/main/java/com/example/controller/ProductController.java ===
+package com.example.controller;
+
+import com.example.dto.request.CreateProductRequestDto;
+import com.example.dto.response.ProductResponseDto;
+import com.example.service.ProductService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/v1") // Changement de la route de base pour plus de flexibilité
+@RequiredArgsConstructor
+public class ProductController {
+
+    private final ProductService productService;
+
+    /**
+     * Endpoint pour créer un nouveau produit.
+     * Accessible uniquement par les utilisateurs ayant le rôle 'ROLE_EDITOR'.
+     *
+     * @param requestDto Les données du produit à créer.
+     * @return Le produit créé avec un statut 201.
+     */
+    @PostMapping("/products")
+    @PreAuthorize("hasAuthority('ROLE_EDITOR')") // Sécurisation de l'endpoint
+    public ResponseEntity<ProductResponseDto> createProduct(@Valid @RequestBody CreateProductRequestDto requestDto) {
+        // Récupère le nom d'utilisateur de l'utilisateur authentifié depuis le contexte de sécurité.
+        String username = SecurityContextHolder.getContext().getAuthentication().getName();
+        
+        ProductResponseDto createdProduct = productService.createProduct(requestDto, username);
+        return new ResponseEntity<>(createdProduct, HttpStatus.CREATED);
+    }
+
+    /**
+     * Endpoint PUBLIC pour récupérer tous les produits de la marketplace.
+     * @return La liste de tous les produits.
+     */
+    @GetMapping("/products")
+    public ResponseEntity<List<ProductResponseDto>> getAllProducts() {
+        List<ProductResponseDto> products = productService.getAllProducts();
+        return ResponseEntity.ok(products);
+    }
+
+    /**
+     * Endpoint PUBLIC pour récupérer un produit spécifique par son ID.
+     * @param id L'ID du produit.
+     * @return Le produit trouvé.
+     */
+    @GetMapping("/products/{id}")
+    public ResponseEntity<ProductResponseDto> getProductById(@PathVariable UUID id) {
+        System.out.println("CONTROLLER: Requête reçue pour les avec l'ID: {}"+ id);
+        ProductResponseDto product = productService.getProductById(id);
+        return ResponseEntity.ok(product);
+    }
+    
+    /**
+     * Endpoint PUBLIC pour lister tous les produits d'un éditeur spécifique.
+     * @param editorId L'ID de l'éditeur.
+     * @return La liste de ses produits.
+     */
+    @GetMapping("/editors/{editorId}/products")
+    public ResponseEntity<List<ProductResponseDto>> getProductsByEditor(@PathVariable UUID editorId) {
+        System.out.println("CONTROLLER: Requête reçue pour les produits de l'éditeur avec l'ID: {}"+ editorId);
+        List<ProductResponseDto> products = productService.getProductsByEditor(editorId);
+        return ResponseEntity.ok(products);
+    }
+}
+=== ./src/main/java/com/example/controller/AffiliateController.java ===
+
+=== ./src/main/java/com/example/controller/EditorController.java ===
+
+=== ./src/main/java/com/example/config/OpenApiConfig.java ===
+
+=== ./src/main/java/com/example/config/WebConfig.java ===
+
+=== ./src/main/java/com/example/config/SecurityConfig.java ===
+package com.example.config;
+
+import com.example.security.JwtAuthenticationFilter;
+import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+
+@Configuration
+@EnableWebSecurity
+@EnableMethodSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtAuthenticationFilter jwtAuthFilter;
+
+     @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .authorizeHttpRequests(auth -> auth
+                // --- MODIFICATION CLÉ ICI ---
+                .requestMatchers("/api/v1/auth/**").permitAll() // L'authentification est publique
+                .requestMatchers(HttpMethod.GET, "/api/v1/products/**").permitAll() // La LECTURE des produits est publique
+                .requestMatchers(HttpMethod.GET, "/api/v1/editors/**").permitAll() // La LECTURE des éditeurs/leurs produits est publique
+                .anyRequest().authenticated() // TOUT le reste nécessite une authentification
+            )
+            .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .addFilterBefore(jwtAuthFilter, UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+}
+=== ./src/main/java/com/example/config/ApplicationConfig.java ===
+package com.example.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.config.annotation.authentication.configuration.AuthenticationConfiguration;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+
+@Configuration
+public class ApplicationConfig {
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+    
+    @Bean
+    public AuthenticationManager authenticationManager(AuthenticationConfiguration config) throws Exception {
+        return config.getAuthenticationManager();
+    }
+}
+=== ./src/main/java/com/example/repository/CollaborationRepository.java ===
+package com.example.repository;
+
+import com.example.entity.Collaboration;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+import java.util.UUID;
+
+@Repository
+public interface CollaborationRepository extends JpaRepository<Collaboration, UUID> {
+
+    /**
+     * Trouve toutes les collaborations pour un éditeur donné.
+     * @param editorId L'ID de l'éditeur.
+     * @return La liste de ses collaborations.
+     */
+    List<Collaboration> findByEditorId(UUID editorId);
+
+    /**
+     * Trouve toutes les collaborations pour un affilié donné.
+     * @param affiliateId L'ID de l'affilié.
+     * @return La liste de ses collaborations.
+     */
+    List<Collaboration> findByAffiliateId(UUID affiliateId);
+}
+=== ./src/main/java/com/example/repository/ProductRepository.java ===
+package com.example.repository;
+
+import com.example.entity.Product;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+import java.util.UUID;
+
+@Repository
+public interface ProductRepository extends JpaRepository<Product, UUID> {
+
+    /**
+     * Recherche des produits par catégorie.
+     */
+    List<Product> findByCategory(String category);
+    
+    /**
+     * Recherche tous les produits appartenant à un éditeur spécifique.
+     * Le nom 'findByEditorId' est interprété par Spring pour créer la bonne requête.
+     *
+     * @param editorId L'ID de l'utilisateur éditeur.
+     * @return Une liste de produits pour cet éditeur.
+     */
+    List<Product> findByEditorId(UUID editorId);
+}
+=== ./src/main/java/com/example/repository/CommentRepository.java ===
+
+=== ./src/main/java/com/example/repository/PostRepository.java ===
+
+=== ./src/main/java/com/example/repository/TransactionRepository.java ===
+package com.example.repository;
+
+import com.example.entity.Transaction;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.List;
+import java.util.UUID;
+
+/**
+ * Repository pour l'accès aux données de l'entité Transaction.
+ */
+@Repository
+public interface TransactionRepository extends JpaRepository<Transaction, UUID> {
+
+    // --- Méthodes pour les dashboards (à utiliser plus tard) ---
+
+    /**
+     * Trouve toutes les transactions apportées par un affilié spécifique.
+     * Utile pour le dashboard de l'affilié.
+     * @param affiliateId L'ID de l'affilié.
+     * @return Une liste de ses transactions.
+     */
+    List<Transaction> findByAffiliateId(UUID affiliateId);
+
+    /**
+     * Trouve toutes les transactions liées aux produits d'un éditeur spécifique.
+     * Utile pour le dashboard de l'éditeur.
+     * @param editorId L'ID de l'éditeur (via product.editor.id).
+     * @return Une liste des transactions pour les produits de cet éditeur.
+     */
+    List<Transaction> findByProductEditorId(UUID editorId);
+
+}
+=== ./src/main/java/com/example/repository/UserRepository.java ===
+package com.example.repository;
+
+import com.example.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.Optional;
+import java.util.UUID;
+
+@Repository
+public interface UserRepository extends JpaRepository<User, UUID> {
+
+    // Spring Data JPA va créer automatiquement les requêtes pour ces méthodes.
+
+    /**
+     * Trouve un utilisateur par son nom d'utilisateur.
+     * @param username Le nom d'utilisateur à rechercher.
+     * @return Un Optional contenant l'utilisateur s'il est trouvé.
+     */
+    Optional<User> findByUsername(String username);
+
+    /**
+     * Trouve un utilisateur par son adresse e-mail.
+     * @param email L'email à rechercher.
+     * @return Un Optional contenant l'utilisateur s'il est trouvé.
+     */
+    Optional<User> findByEmail(String email);
+
+    /**
+     * Vérifie si un utilisateur existe avec ce nom d'utilisateur.
+     * @param username Le nom d'utilisateur à vérifier.
+     * @return true si l'utilisateur existe, false sinon.
+     */
+    Boolean existsByUsername(String username);
+
+    /**
+     * Vérifie si un utilisateur existe avec cet e-mail.
+     * @param email L'email à vérifier.
+     * @return true si l'utilisateur existe, false sinon.
+     */
+    Boolean existsByEmail(String email);
+}
+=== ./src/main/java/com/example/repository/LikeRepository.java ===
+
+=== ./src/main/java/com/example/exception/ResourceNotFoundException.java ===
+package com.example.exception;
+
+import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.ResponseStatus;
+
+/**
+ * Exception personnalisée levée lorsqu'une ressource demandée n'est pas trouvée.
+ * L'annotation @ResponseStatus indique à Spring de retourner automatiquement
+ * un code HTTP 404 NOT FOUND lorsque cette exception est levée par un controller.
+ */
+@ResponseStatus(HttpStatus.NOT_FOUND)
+public class ResourceNotFoundException extends RuntimeException {
+
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+=== ./src/main/java/com/example/exception/GlobalExceptionHandler.java ===
+
